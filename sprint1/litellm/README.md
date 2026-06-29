@@ -1,212 +1,141 @@
 # LiteLLM Proxy — Sprint 1 Day 2
 
-OpenAI-compatible proxy fronting **DGX Spark Ollama models** behind a single endpoint at `http://localhost:4000/v1`. Built on 2026-06-29 as the architectural keystone of the summer stack.
+OpenAI-compatible proxy fronting DGX Spark Ollama models at http://localhost:4000/v1. Single endpoint, multiple backends, OpenAI-compatible protocol throughout.
 
-## Why this exists
+## Mental model (read first)
 
-Every future agent, MCP server, RAG pipeline, and benchmark in this repo will call **one URL**: `http://localhost:4000/v1`. LiteLLM routes the request to the right backend (Ollama local, vLLM local, AWS Bedrock cloud) based on the `model` field in the request body. Application code never changes when backends change.
+Three machines, three meanings of localhost.
 
----
+Machines:
+- Mac (physical): Docker Desktop, SSH tunnel process, your terminal
+- Container (virtual on Mac, isolated network namespace): LiteLLM Python proxy
+- DGX Spark (physical, at home, NVIDIA GB10): Ollama serving models on GPU
 
-## Conceptual foundations
+The container is physically on the Mac but networking-wise is a separate machine with its own loopback.
 
-Three concepts collide in this setup. Understanding them turns the configuration from magic into mechanics.
+Three meanings of localhost - always means this machine from the asker perspective:
+- Mac terminal: localhost = the Mac
+- Inside LiteLLM container: localhost = the container itself, NOT the Mac
+- Inside ssh -L second arg: localhost = the remote host (DGX), interpreted after the tunnel arrives
 
-### OpenAI-compatible endpoint
+This is why config.yaml uses host.docker.internal, not localhost. From inside the container, localhost is the container; host.docker.internal is Docker magic name for the Mac host.
 
-An OpenAI-compatible endpoint is any HTTP server that accepts requests and returns responses in the **exact JSON shape OpenAI's official API uses**. Request: `POST /v1/chat/completions` with `{model, messages, temperature, max_tokens}`. Response: `{choices: [{message: {content: ...}}], usage: {prompt_tokens, completion_tokens}}`.
+Four ports:
+- 4000 on Mac (mapped to container): LiteLLM listener you call
+- 4000 inside container: same service, internal view
+- 11435 on Mac: SSH tunnel listener
+- 11434 on DGX: Ollama systemd service
 
-After ChatGPT launched, every modern provider (Ollama, vLLM, Mistral, Anthropic via wrappers, Bedrock via LiteLLM, SageMaker via custom handlers) adopted this format. Consequence: **any client written for OpenAI works against all of them by changing two strings** — `base_url` and the `model` parameter. That's why this stack is composable — local + cloud + fine-tuned models all swap behind one protocol.
+Why 11435 on Mac and 11434 on DGX? Port 11434 was held by a stale process on Mac during setup. SSH -L lets the local and remote ports differ.
 
-### base_url anatomy
+Request path:
+1. Mac terminal: curl http://localhost:4000/...
+2. Docker port-map: Mac:4000 to container:4000
+3. LiteLLM in container reads config.yaml, finds api_base host.docker.internal:11435
+4. Container DNS resolves to Mac IP, sends HTTP to Mac:11435
+5. Mac:11435 is the SSH tunnel listener, forwards encrypted to DGX
+6. On DGX, SSH delivers to localhost:11434 (Ollama)
+7. Ollama runs model on GB10 GPU, returns JSON back
 
-`http://localhost:4000/v1` has four parts:
+Why this architecture: LiteLLM is the single front door (port 4000) hiding heterogeneous backends. Tomorrow add claude-sonnet-bedrock, same localhost:4000, different model name, AWS Bedrock underneath. Client code never changes.
 
-| Part | Value | Meaning |
-|---|---|---|
-| Scheme | `http://` | Protocol |
-| Host | `localhost` | Which machine answers |
-| Port | `4000` | Which TCP port that machine listens on |
-| Path prefix | `/v1` | The OpenAI-compat API namespace |
+## Current config.yaml
 
-Client libraries append `/chat/completions`, `/embeddings`, `/models` automatically. You provide the `base_url`, the library handles the rest.
+Three Ollama models routed via SSH tunnel:
 
-### "localhost" means three different things in this stack
+model_list with three entries:
+- llama-3.1-8b-local (Llama 3.1 8B)
+- llama-3.3-70b-local (Llama 3.3 70B)
+- mistral-small-local (Mistral Small 23.6B)
 
-`localhost` always means *"this machine, from the perspective of whoever is asking"* — but the asker changes. The word is the same; the destination is not.
+Each entry uses:
+- model: openai/<exact-ollama-name>
+- api_base: http://host.docker.internal:11435/v1
+- api_key: ollama (dummy, required non-empty)
 
-| Where used | "localhost" resolves to | Why |
-|---|---|---|
-| Mac terminal: `curl localhost:4000` | The Mac | You're on the Mac asking |
-| Inside Docker container: `localhost:11434` | The container itself, NOT the Mac | Each container has its own network namespace |
-| SSH `-L 11435:localhost:11434` | The DGX (remote) | This `localhost` is interpreted at DGX, after the SSH tunnel arrives |
+general_settings.master_key: os.environ/LITELLM_MASTER_KEY (read from env var)
 
-This is why `config.yaml` uses **`host.docker.internal`** instead of `localhost` for the `api_base`. From inside the LiteLLM container, `localhost` would mean the container itself; `host.docker.internal` is Docker's magic hostname that resolves to the Mac host.
+The openai/ prefix is a protocol selector - tells LiteLLM to use generic OpenAI HTTP client. For Bedrock you would write bedrock/anthropic.claude-... and LiteLLM uses AWS SDK instead.
 
-Mental model: imagine three computers — Mac, Container (lives on Mac but isolated), DGX. Each thinks of itself as `localhost`. When they need to reach each other, they use non-localhost names: `host.docker.internal` (container → Mac), forwarded port via SSH (Mac → DGX).
+## Setup from scratch
 
----
+Prerequisites: Docker Desktop running, SSH config has dgx-spark-wan-marouene, Ollama on DGX with OLLAMA_HOST=0.0.0.0:11434, at least one model pulled.
 
-## Architecture
-## Connection scenarios
+Step 1 - SSH tunnel in dedicated tab:
+  ssh -N -L 11435:localhost:11434 dgx-spark-wan-marouene
+  Goes silent. Leave tab open. If port busy: lsof -ti :11435 | xargs kill -9
 
-Where your Mac is determines how it reaches DGX Spark:
+Step 2 - Verify tunnel:
+  curl -sS http://localhost:11435/api/tags
+  Returns JSON of DGX models = working
 
-| Mac location | URL to reach DGX | Setup |
-|---|---|---|
-| Same home Wi-Fi as DGX | `http://10.10.4.116:11434/v1` | None — direct LAN |
-| Away from home (café, mobile, different LAN) | `http://localhost:11435/v1` after `ssh -N -L 11435:localhost:11434 dgx-spark-wan-marouene` | SSH tunnel per session |
-| Anywhere, encrypted, stable hostname | `http://spark-18e5:11434/v1` | Install Tailscale on both (~15 min, once) |
-| WAN port forwarding | Not recommended | Ollama has zero built-in auth — exposes GPU publicly |
+Step 3 - Master key:
+  openssl rand -hex 32 > .master-key
+  chmod 600 .master-key
+  echo .master-key > .gitignore
 
-This setup uses the **SSH tunnel** path (row 2) because the Mac is currently on a different network than DGX even when "at home." Port 11435 instead of 11434 because something held 11434 on the Mac at setup time.
+Step 4 - Launch:
+  export LITELLM_MASTER_KEY=$(cat .master-key)
+  docker run -d --name litellm -p 4000:4000 -v $(pwd)/config.yaml:/app/config.yaml -e LITELLM_MASTER_KEY=$LITELLM_MASTER_KEY ghcr.io/berriai/litellm:main-latest --config /app/config.yaml --port 4000
 
----
+Step 5 - Verify health:
+  sleep 5 && docker ps | grep litellm && docker logs litellm 2>&1 | tail -20
+  Look for: Uvicorn running on http://0.0.0.0:4000
 
-## Files
+## Smoke tests (one per model)
 
-| File | Purpose |
-|---|---|
-| `config.yaml` | LiteLLM model routing — `model_name` → `api_base` |
-| `.master-key` | Random 64-char hex Bearer token. **Gitignored.** |
-| `.gitignore` | Excludes `.master-key` |
-| `README.md` | This file |
+All three follow the same pattern, only model field changes. Required: Authorization Bearer header, Content-Type header.
 
-## Start from scratch
+Pattern:
+  curl http://localhost:4000/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" -d (JSON body with model alias, messages, max_tokens)
 
-### 1. SSH tunnel (dedicated Mac terminal tab)
+Three aliases to test: llama-3.1-8b-local, llama-3.3-70b-local, mistral-small-local
 
-```bash
-ssh -N -L 11435:localhost:11434 dgx-spark-wan-marouene
-```
+Notes:
+- 70B is slow first call (~30-60s VRAM load), then fast
+- Mistral has heavy template (~160 prompt tokens for ping), bump max_tokens to 200+
+- Success = JSON with choices[0].message.content populated, system_fingerprint fp_ollama
 
-Terminal goes silent. Leave it alone. If port 11435 is taken: `lsof -ti :11435 | xargs kill -9` then retry.
+## Daily operations
 
-### 2. Verify tunnel
-
-```bash
-curl -sS http://localhost:11435/api/tags
-```
-
-Should return JSON listing DGX models.
-
-### 3. Launch LiteLLM
-
-```bash
-cd ~/Project_Codes/genai-summer-2026/sprint1/litellm
-export LITELLM_MASTER_KEY=$(cat .master-key)
-
-docker run -d \
-  --name litellm \
-  -p 4000:4000 \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  -e LITELLM_MASTER_KEY=$LITELLM_MASTER_KEY \
-  ghcr.io/berriai/litellm:main-latest \
-  --config /app/config.yaml --port 4000
-
-sleep 5
-docker logs litellm 2>&1 | tail -10
-```
-
-Look for `Uvicorn running on http://0.0.0.0:4000`.
-
-### 4. Smoke test
-
-```bash
-MASTER_KEY=$(cat .master-key)
-
-curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"llama-3.1-8b-local","messages":[{"role":"user","content":"ping"}],"max_tokens":50}'
-```
-
-Coherent JSON response = end-to-end pipeline working.
-
-## Stop / restart / inspect
-
-```bash
-docker stop litellm
-docker start litellm
-docker restart litellm    # after editing config.yaml
-docker rm -f litellm      # delete container, recreate via Step 3
-docker logs -f litellm    # follow live
-```
-
-Tunnel is independent of the container. Closing the tunnel tab leaves the container running but unable to reach Ollama — next request returns an upstream connection error.
+- Start: open tunnel tab, export LITELLM_MASTER_KEY, docker start litellm
+- Stop: docker stop litellm (preserves container), close tunnel tab
+- Restart after config change: docker restart litellm
+- Wipe and reinstall: docker rm -f litellm && docker rmi ghcr.io/berriai/litellm:main-latest
+- Logs: docker logs litellm or docker logs -f litellm (follow)
+- Health: curl http://localhost:4000/health/liveliness
+- List models exposed: curl http://localhost:4000/v1/models with Bearer auth
 
 ## Adding a new model
 
-1. `ollama pull <new-model>` on DGX Spark
-2. Add a new entry to `config.yaml`:
-```yaml
-   - model_name: <client-alias>
-     litellm_params:
-       model: openai/<ollama-model-id>
-       api_base: http://host.docker.internal:11435/v1
-       api_key: "ollama"
-```
-3. `docker restart litellm`
-4. Smoke test using the new `model_name` via the LiteLLM endpoint (not Ollama directly — that wouldn't test the routing layer)
+1. ssh dgx-spark-wan-marouene then ollama pull <model>
+2. Verify exact name with ollama list
+3. Add entry to config.yaml with model_name (your alias) and model openai/<exact-ollama-name>
+4. docker restart litellm
+5. Smoke test through localhost:4000 (not Ollama directly)
 
-## Verification commands
+## Lessons from setup (Jun 29-30)
 
-```bash
-# Tunnel alive?           curl -sS http://localhost:11435/api/tags
-# Container up?           docker ps | grep litellm
-# Healthy?                curl http://localhost:4000/health/liveliness
-# What models exposed?    curl http://localhost:4000/v1/models -H "Authorization: Bearer $(cat .master-key)"
-```
+1. Port 11434 conflict on Mac - use 11435 locally
+2. host.docker.internal, not localhost, in api_base
+3. openai/ prefix is the protocol selector
+4. api_key ollama is dummy, required non-empty
+5. Auth header mandatory in curl: Bearer LITELLM_MASTER_KEY
+6. .master-key only readable from this directory, cd here or export the env var
+7. Model name in curl must match model_name alias exactly, not the Ollama ID
+8. First request slow (~30-60s for 70B VRAM load), OLLAMA_KEEP_ALIVE=10m keeps warm
+9. SSH tunnel is per-session, Mac sleep kills it, consider Tailscale long-term
+10. Multi-line heredoc + comments + zsh can hang on quote prompt, Ctrl+C to recover
 
-## Config reference
+## What is next
 
-`config.yaml` is the source of truth:
-
-```yaml
-model_list:
-  - model_name: llama-3.1-8b-local    # client-facing alias
-    litellm_params:
-      model: openai/llama3.1:8b       # backend id (openai/ = backend speaks OpenAI protocol)
-      api_base: http://host.docker.internal:11435/v1
-      api_key: "ollama"               # dummy, Ollama doesn't enforce auth
-
-  - model_name: llama-3.3-70b-local
-    litellm_params:
-      model: openai/llama3.3:70b
-      api_base: http://host.docker.internal:11435/v1
-      api_key: "ollama"
-
-litellm_settings:
-  drop_params: true                   # silently drops unsupported OpenAI params
-
-general_settings:
-  master_key: "os.environ/LITELLM_MASTER_KEY"
-```
-
-The `openai/` prefix is the **protocol selector**, not the model family. It tells LiteLLM "this backend speaks OpenAI protocol — use the generic OpenAI client." For Bedrock you'd write `bedrock/anthropic.claude-3-5-sonnet-...` instead, and LiteLLM uses the AWS SDK with sigv4 auth.
-
-## Lessons from setup (Jun 29)
-
-These cost real time during the build — saved here so they don't cost more next time:
-
-1. **Port 11434 conflict on Mac** — a stale process held it. Switched to `11435` for the Mac end of the tunnel; DGX side stays 11434. Kill stale processes: `lsof -ti :11435 | xargs kill -9`.
-2. **`host.docker.internal`, not `localhost`** in `config.yaml` `api_base`. From inside Docker, `localhost` means the container; `host.docker.internal` means the Mac host. (See "localhost means three different things" above.)
-3. **`openai/` model prefix** = protocol selector. Tells LiteLLM the backend speaks OpenAI protocol regardless of model family. Without it, LiteLLM tries to route via a native provider library and fails.
-4. **`api_key: "ollama"`** is a dummy — Ollama ignores it but LiteLLM's parser requires a non-empty string. Any value works.
-5. **`.master-key` only readable from this directory.** Running curl from monorepo root fails. Either `cd` here first or export `MASTER_KEY` in your shell profile.
-6. **First request on a fresh model is slow** — Ollama loads weights to VRAM on demand. `OLLAMA_KEEP_ALIVE=10m` in DGX systemd override keeps the model warm.
-7. **The SSH tunnel is per-session.** Closing the terminal tab kills it. For long sessions, consider Tailscale (stable hostname, survives across networks).
-
-## What's next
-
-This proxy is the foundation. Next sprint days extend it:
-
-- **Day 3** — Add `success_callback: ["langfuse"]` to `litellm_settings` for traces. Every call gets logged with latency, cost, full prompt/response.
-- **Day 4** — Add Bedrock entries with `model: bedrock/anthropic.claude-3-5-sonnet-...` and `aws_region_name: eu-west-1`. Now the same `localhost:4000/v1` serves local AND cloud models.
-- **Day 1 Phase 2** — Add `qwen3-32b-local` pointing at vLLM on DGX port 8000 (separate port from Ollama, separate tunnel `-L 18000:localhost:8000`).
+- Day 3: LangFuse observability via success_callback langfuse in litellm_settings
+- Day 4: Bedrock cloud models with bedrock/anthropic.claude-... and AWS creds
+- Day 1 Phase 2: vLLM Qwen3 32B with separate SSH tunnel on port 18000
 
 ## References
 
-- LiteLLM proxy docs: https://docs.litellm.ai/docs/proxy/quick_start
+- LiteLLM proxy quick start: https://docs.litellm.ai/docs/proxy/quick_start
+- LiteLLM model config: https://docs.litellm.ai/docs/proxy/configs
 - Ollama OpenAI compatibility: https://github.com/ollama/ollama/blob/main/docs/openai.md
-- Parent repo README: `../../README.md`
+- Parent repo README: ../../README.md

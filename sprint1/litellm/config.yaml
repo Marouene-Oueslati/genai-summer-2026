@@ -11,8 +11,11 @@ model_list:
       api_base: http://host.docker.internal:11435/v1
       api_key: "ollama"
 
-litellm_settings:
-  drop_params: true
+  - model_name: mistral-small-local
+    litellm_params:
+      model: openai/mistral-small:latest
+      api_base: http://host.docker.internal:11435/v1
+      api_key: "ollama"
 
 general_settings:
   master_key: "os.environ/LITELLM_MASTER_KEY"
