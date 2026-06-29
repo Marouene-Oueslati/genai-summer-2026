@@ -1,4 +1,4 @@
-> **New to this layer?** Start with [CONCEPTS.md](./CONCEPTS.md) for the localhost/port/config refresher, then come back here for setup.
+> **New to this layer?** Start with [CONCEPTS.md](./sprint1/litellm/CONCEPTS.md) for the localhost/port/config refresher, then come back here for setup.
 
 # GenAI Summer 2026
 
