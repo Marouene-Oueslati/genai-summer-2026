@@ -1,3 +1,5 @@
+> **New to this layer?** Start with [CONCEPTS.md](./CONCEPTS.md) for the localhost/port/config refresher, then come back here for setup.
+
 # GenAI Summer 2026
 
 Personal learning repo built during a structured 7-week sprint plan (Jun 24 – Aug 14, 2026). Goal: master end-to-end GenAI orchestration, AWS ML certification (MLA-C01), and the architectural patterns needed for defense/NATO consulting work.
