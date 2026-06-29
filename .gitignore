@@ -1,0 +1,7 @@
+.master-key
+.env
+*.pem
+.aws/
+__pycache__/
+.venv/
+node_modules/
