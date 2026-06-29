@@ -43,6 +43,38 @@ Why 11435 on Mac and 11434 on DGX? Port 11434 was held by a stale process on Mac
 
 ### Request path
 
+```
+[1] Mac terminal: curl http://localhost:4000/v1/chat/completions
+        |
+        | localhost = Mac
+        v
+[2] Docker port-map: Mac:4000 -> container:4000
+        |
+        v
+[3] LiteLLM in container reads config.yaml
+        Looks up "model": "llama-3.1-8b-local"
+        Finds api_base: http://host.docker.internal:11435/v1
+        |
+        v
+[4] Container DNS resolves host.docker.internal -> Mac IP
+        Sends HTTP to Mac:11435
+        |
+        v
+[5] Mac:11435 is the SSH tunnel listener
+        Encrypts request, forwards through SSH to DGX
+        |
+        v
+[6] On DGX, SSH delivers to localhost:11434
+        localhost here = DGX
+        |
+        v
+[7] Ollama on port 11434 runs model on GB10 GPU
+        Returns JSON response
+        |
+        v
+    Response travels back: 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1
+```
+
 ### Why this architecture
 
 LiteLLM is the single front door (port 4000) hiding heterogeneous backends behind one OpenAI-compatible protocol. Client code says `model: "llama-3.1-8b-local"` and LiteLLM routes. Tomorrow add `claude-sonnet-bedrock` — same `localhost:4000`, different model name, AWS Bedrock underneath. Client code never changes.
